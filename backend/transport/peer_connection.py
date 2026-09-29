@@ -53,6 +53,7 @@ class PeerConnectionWrapper:
         self._connected_event = asyncio.Event()
         self._failed_event = asyncio.Event()
         self._pending_candidates: List[Dict[str, Any]] = []
+        self._logged_active_pair: bool = False
 
         # Setup DataChannels based on role
         if self.role == "send":
@@ -65,12 +66,29 @@ class PeerConnectionWrapper:
 
     def _setup_listeners(self) -> None:
         """Attach state change handlers to RTCPeerConnection."""
+        @self.pc.on("icecandidate")
+        def on_ice_candidate(candidate: Optional[RTCIceCandidate]) -> None:
+            if candidate:
+                logger.info(
+                    "Discovered local ICE candidate: type=%s, protocol=%s, ip=%s, port=%s",
+                    getattr(candidate, "type", "unknown"),
+                    getattr(candidate, "protocol", "unknown"),
+                    getattr(candidate, "ip", "unknown"),
+                    getattr(candidate, "port", "unknown"),
+                )
+
+        @self.pc.on("icegatheringstatechange")
+        def on_ice_gathering_state_change() -> None:
+            state = self.pc.iceGatheringState
+            logger.info("RTCPeerConnection iceGatheringState -> %s", state)
+
         @self.pc.on("connectionstatechange")
         def on_connection_state_change() -> None:
             state = self.pc.connectionState
             logger.info("RTCPeerConnection connectionState -> %s", state)
             if state in ("connected", "completed"):
                 self._connected_event.set()
+                self._log_active_candidate_pair()
             elif state in ("failed", "closed"):
                 self._failed_event.set()
 
@@ -80,8 +98,57 @@ class PeerConnectionWrapper:
             logger.info("RTCPeerConnection iceConnectionState -> %s", state)
             if state in ("connected", "completed"):
                 self._connected_event.set()
+                self._log_active_candidate_pair()
             elif state == "failed":
                 self._failed_event.set()
+
+    def _log_active_candidate_pair(self) -> None:
+        """Identify and log active/selected ICE candidate pair and connection mode."""
+        if self._logged_active_pair:
+            return
+        try:
+            if self.pc.sctp and self.pc.sctp.transport:
+                dtls_transport = self.pc.sctp.transport
+                ice_transport = getattr(dtls_transport, "transport", None)
+                connection = getattr(ice_transport, "_connection", None)
+                nominated = getattr(connection, "_nominated", None)
+                if nominated:
+                    pair = nominated.get(1) or (list(nominated.values())[0] if nominated else None)
+                    if pair:
+                        local_cand = getattr(pair, "local_candidate", None)
+                        remote_cand = getattr(pair, "remote_candidate", None)
+                        local_type = getattr(local_cand, "type", "unknown")
+                        remote_type = getattr(remote_cand, "type", "unknown")
+
+                        if local_type == "relay" or remote_type == "relay":
+                            conn_mode = "TURN relay"
+                        elif local_type in ("srflx", "prflx") or remote_type in ("srflx", "prflx"):
+                            conn_mode = "STUN server-reflexive (srflx)"
+                        elif local_type == "host" and remote_type == "host":
+                            conn_mode = "direct/host"
+                        else:
+                            conn_mode = f"{local_type} <-> {remote_type}"
+
+                        local_host = getattr(local_cand, "host", "unknown")
+                        local_port = getattr(local_cand, "port", "unknown")
+                        remote_host = getattr(remote_cand, "host", "unknown")
+                        remote_port = getattr(remote_cand, "port", "unknown")
+
+                        self._logged_active_pair = True
+                        logger.info(
+                            "Selected ICE candidate pair: %s (%s candidate [%s:%s] <-> %s candidate [%s:%s])",
+                            conn_mode,
+                            local_type,
+                            local_host,
+                            local_port,
+                            remote_type,
+                            remote_host,
+                            remote_port,
+                        )
+                        return
+            logger.info("Active ICE candidate pair detail not available from transport.")
+        except Exception as exc:
+            logger.debug("Error retrieving active ICE candidate pair: %s", exc)
 
     @property
     def connection_state(self) -> str:
@@ -158,6 +225,13 @@ class PeerConnectionWrapper:
             cand = candidate_from_sdp(sdp_str)
             cand.sdpMid = candidate_data.get("sdpMid")
             cand.sdpMLineIndex = candidate_data.get("sdpMLineIndex")
+            logger.info(
+                "Discovered remote ICE candidate: type=%s, protocol=%s, ip=%s, port=%s",
+                getattr(cand, "type", "unknown"),
+                getattr(cand, "protocol", "unknown"),
+                getattr(cand, "ip", "unknown"),
+                getattr(cand, "port", "unknown"),
+            )
             await self.pc.addIceCandidate(cand)
             logger.debug("Applied ICE candidate: %s", cand)
         except Exception as exc:
