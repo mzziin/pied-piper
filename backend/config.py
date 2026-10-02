@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     """Application settings with type validation and defaults."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=Path(__file__).resolve().parent.parent / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
