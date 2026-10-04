@@ -51,6 +51,11 @@ async def start_send_session(
     pc_wrapper: Optional[PeerConnectionWrapper] = None
 
     try:
+        from backend.signaling.server import is_local_signaling_url, start_embedded_signaling_server
+
+        if is_local_signaling_url(settings.signaling_url):
+            start_embedded_signaling_server(host=settings.signaling_host, port=settings.signaling_port)
+
         signaling = SignalingClient(url=settings.signaling_url)
         await signaling.connect()
 
@@ -134,6 +139,11 @@ async def start_receive_session(
     pc_wrapper: Optional[PeerConnectionWrapper] = None
 
     try:
+        from backend.signaling.server import is_local_signaling_url, start_embedded_signaling_server
+
+        if is_local_signaling_url(settings.signaling_url):
+            start_embedded_signaling_server(host=settings.signaling_host, port=settings.signaling_port)
+
         signaling = SignalingClient(url=settings.signaling_url)
         await signaling.connect()
 

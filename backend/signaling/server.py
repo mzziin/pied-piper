@@ -4,8 +4,12 @@ import argparse
 import asyncio
 import json
 import logging
+import socket
+import threading
+import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Optional
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -197,6 +201,108 @@ async def signaling_websocket(websocket: WebSocket) -> None:
                         other_peer,
                         RoomExpiredMessage(),
                     )
+
+
+_embedded_server: Optional[Any] = None
+_embedded_thread: Optional[threading.Thread] = None
+_embedded_lock = threading.Lock()
+
+
+def is_local_signaling_url(url: str) -> bool:
+    """Check if the provided WebSocket URL points to the local machine."""
+    try:
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower()
+        if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+            return True
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            if info[4][0] == hostname:
+                return True
+        if socket.gethostbyname(socket.gethostname()) == hostname:
+            return True
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((hostname, 0))
+            return True
+        finally:
+            s.close()
+    except Exception:
+        return False
+
+
+def is_port_listening(host: str, port: int) -> bool:
+    """Check if a TCP port is open and accepting connections."""
+    test_hosts = ["127.0.0.1"]
+    if host not in ("0.0.0.0", "127.0.0.1", "localhost"):
+        test_hosts.append(host)
+    for h in test_hosts:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.2)
+            res = sock.connect_ex((h, port))
+            sock.close()
+            if res == 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def start_embedded_signaling_server(
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    log_level: str = "warning",
+) -> bool:
+    """
+    Ensure a signaling server is running on the target host and port.
+    If the port is already listening, returns True immediately.
+    Otherwise, starts the FastAPI signaling server via uvicorn in a daemon thread.
+    """
+    global _embedded_server, _embedded_thread
+    import uvicorn
+
+    bind_host = host or settings.signaling_host
+    bind_port = port or settings.signaling_port
+
+    if is_port_listening(bind_host, bind_port):
+        return True
+
+    with _embedded_lock:
+        if is_port_listening(bind_host, bind_port):
+            return True
+
+        logger.info("Starting embedded signaling server on %s:%d", bind_host, bind_port)
+        config = uvicorn.Config(
+            app=app,
+            host=bind_host,
+            port=bind_port,
+            log_level=log_level,
+        )
+        server = uvicorn.Server(config=config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        _embedded_server = server
+        _embedded_thread = thread
+
+        start_time = time.time()
+        while time.time() - start_time < 2.0:
+            if is_port_listening(bind_host, bind_port):
+                logger.info("Embedded signaling server is ready on %s:%d", bind_host, bind_port)
+                return True
+            time.sleep(0.05)
+
+    return is_port_listening(bind_host, bind_port)
+
+
+def stop_embedded_signaling_server() -> None:
+    """Stop the embedded signaling server if running."""
+    global _embedded_server, _embedded_thread
+    with _embedded_lock:
+        if _embedded_server is not None:
+            _embedded_server.should_exit = True
+            _embedded_server = None
+            _embedded_thread = None
 
 
 def main() -> None:
