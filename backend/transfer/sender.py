@@ -1,4 +1,4 @@
-"""File transfer sender implementation for Phase 7 full protocol."""
+"""File transfer sender implementation with Phase 8 sliding window flow control."""
 
 import asyncio
 import logging
@@ -7,6 +7,7 @@ import time
 from typing import Callable, Optional
 import uuid
 
+from backend.config import get_settings
 from backend.protocol.chunking import FileChunkReader, compute_file_manifest
 from backend.protocol.framing import (
     ChunkAckMessage,
@@ -18,9 +19,11 @@ from backend.protocol.framing import (
     TransferFailedMessage,
     TransferOfferMessage,
     TransferRejectMessage,
+    WindowUpdateMessage,
     pack_data_frame,
     parse_control_message,
 )
+from backend.protocol.window import SlidingWindow
 from backend.transport.data_channels import DataChannelManager
 
 logger = logging.getLogger(__name__)
@@ -68,31 +71,34 @@ class TransferSummary:
 
 
 class FileSender:
-    """Orchestrates file streaming over WebRTC DataChannels using Phase 7 protocol."""
+    """Orchestrates file streaming over WebRTC DataChannels using Phase 8 sliding window."""
 
     def __init__(
         self,
         channels: DataChannelManager,
         filepath: Path,
         chunk_size: int = 262144,
+        window_size: Optional[int] = None,
         progress_callback: Optional[Callable[[float, int, int], None]] = None,
         transfer_id: Optional[str] = None,
     ) -> None:
         self.channels: DataChannelManager = channels
         self.filepath: Path = Path(filepath)
         self.chunk_size: int = chunk_size
+        self.window_size: int = window_size or get_settings().sliding_window_size
         self.progress_callback: Optional[Callable[[float, int, int], None]] = progress_callback
         self.transfer_id: str = transfer_id or str(uuid.uuid4())
+        self.window: Optional[SlidingWindow] = None
 
     async def send(self, timeout: float = 60.0) -> TransferSummary:
-        """Execute the complete file transfer send workflow."""
+        """Execute the complete file transfer send workflow using sliding-window flow control."""
         if not self.filepath.is_file():
             raise FileNotFoundError(f"File not found: {self.filepath}")
 
         start_time = time.time()
         file_id = str(uuid.uuid4())
 
-        # 1. Build FileManifestItem (includes per-chunk hashes for Phase 7 integrity)
+        # 1. Build FileManifestItem (includes per-chunk hashes for Phase 7/8 integrity)
         manifest = compute_file_manifest(
             self.filepath,
             chunk_size=self.chunk_size,
@@ -101,11 +107,12 @@ class FileSender:
         )
 
         logger.info(
-            "Initiating transfer %s for '%s' (%d bytes, %d chunks, SHA-256: %s)",
+            "Initiating transfer %s for '%s' (%d bytes, %d chunks, window_size: %d, SHA-256: %s)",
             self.transfer_id,
             self.filepath.name,
             manifest.size,
             manifest.total_chunks,
+            self.window_size,
             manifest.sha256,
         )
 
@@ -125,7 +132,6 @@ class FileSender:
         if isinstance(resp_msg, (TransferFailedMessage,)):
             raise TransferError(f"Transfer error from receiver: {resp_msg.reason}")
         if not isinstance(resp_msg, (TransferAcceptMessage,)):
-            # Check legacy FileAcceptMessage
             if resp_msg.type == "file_accept":
                 pass
             else:
@@ -141,35 +147,50 @@ class FileSender:
         )
         self.channels.send_control(file_start.model_dump())
 
-        # 5. Stream sequential chunks using Phase 7 28-byte data framing
-        chunks_sent = 0
+        # 5. Stream chunks using sliding-window flow control
+        window = SlidingWindow(total_chunks=manifest.total_chunks, window_size=self.window_size)
+        self.window = window
+
         if manifest.total_chunks > 0:
-            reader = FileChunkReader(self.filepath, self.chunk_size, file_id=file_id)
-            for chunk in reader.iter_chunks():
-                # Pack binary frame [16B file_id + 8B index + 4B payload_len + payload]
-                frame = pack_data_frame(file_id, chunk.index, chunk.data)
-                self.channels.send_data(frame)
+            async def _stream_chunks() -> None:
+                """Read chunks sequentially from disk, pausing when the window is full."""
+                reader = FileChunkReader(self.filepath, self.chunk_size, file_id=file_id)
+                for chunk in reader.iter_chunks():
+                    await window.wait_for_slot(timeout=timeout)
+                    frame = pack_data_frame(file_id, chunk.index, chunk.data)
+                    self.channels.send_data(frame)
+                    await window.record_chunk_sent(chunk.index)
 
-                # Await ACK on control channel (stop-and-wait baseline for Phase 7)
-                ack_str = await self.channels.receive_control(timeout=timeout)
-                ack_msg = parse_control_message(ack_str)
+            async def _receive_acks() -> None:
+                """Concurrently read ACKs, NACKs, and window updates from the receiver."""
+                while not window.is_done:
+                    ack_str = await self.channels.receive_control(timeout=timeout)
+                    ack_msg = parse_control_message(ack_str)
 
-                if isinstance(ack_msg, ChunkNackMessage):
-                    raise IntegrityError(f"Receiver reported NACK on chunk {chunk.index}: {ack_msg.reason}")
-                if isinstance(ack_msg, TransferFailedMessage):
-                    raise TransferError(f"Receiver reported fatal failure on chunk {chunk.index}: {ack_msg.reason}")
-                if not isinstance(ack_msg, ChunkAckMessage):
-                    raise TransferError(f"Expected ChunkAckMessage for chunk {chunk.index}, got: {ack_msg}")
-                if ack_msg.chunk_index != chunk.index:
-                    raise TransferError(
-                        f"Chunk index mismatch in ACK: expected {chunk.index}, got {ack_msg.chunk_index}"
-                    )
+                    if isinstance(ack_msg, ChunkAckMessage):
+                        newly_acked = await window.handle_ack(ack_msg.chunk_index)
+                        if newly_acked > 0 and self.progress_callback:
+                            percent = (window.base / manifest.total_chunks) * 100.0
+                            self.progress_callback(percent, window.base, manifest.total_chunks)
 
-                chunks_sent += 1
-                percent = (chunks_sent / manifest.total_chunks) * 100.0
+                    elif isinstance(ack_msg, ChunkNackMessage):
+                        raise IntegrityError(
+                            f"Receiver reported NACK on chunk {ack_msg.chunk_index}: {ack_msg.reason}"
+                        )
 
-                if self.progress_callback:
-                    self.progress_callback(percent, chunks_sent, manifest.total_chunks)
+                    elif isinstance(ack_msg, WindowUpdateMessage):
+                        await window.update_window_size(ack_msg.window_size)
+                        logger.info("Sliding window dynamically updated to size %d", ack_msg.window_size)
+
+                    elif isinstance(ack_msg, TransferFailedMessage):
+                        raise TransferError(f"Receiver reported fatal failure: {ack_msg.reason}")
+
+                    elif isinstance(ack_msg, (TransferRejectMessage,)):
+                        raise TransferError(f"Receiver rejected transfer: {ack_msg.reason}")
+
+            # Run producer and ACK consumer concurrently
+            await asyncio.gather(_stream_chunks(), _receive_acks())
+            await window.wait_all_acked(timeout=timeout)
 
         # 6. Dispatch FileCompleteMessage
         file_complete = FileCompleteMessage(
