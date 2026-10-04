@@ -132,6 +132,84 @@ class TestTransferAPIIntegration(unittest.TestCase):
         self.assertEqual(controller.state, TransferState.FAILED)
         self.assertIsNotNone(controller.error_message)
 
+    def test_live_transfer_api_end_to_end(self) -> None:
+        """Verify full live transfer between start_send_session and start_receive_session using Phase 7 protocol."""
+        import threading
+        import time
+        import uvicorn
+        from backend.config import Settings
+        from backend.signaling.server import app as sig_app
+
+        port = 8899
+        config = uvicorn.Config(app=sig_app, host="127.0.0.1", port=port, log_level="error")
+        server = uvicorn.Server(config=config)
+        server_thread = threading.Thread(target=server.run, daemon=True)
+        server_thread.start()
+        time.sleep(0.4)
+
+        sig_url = f"ws://127.0.0.1:{port}/ws"
+        custom_settings = Settings(
+            signaling_url=sig_url,
+            chunk_size_bytes=8192,
+            _env_file=None,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            source_file = temp_path / "desktop_payload.bin"
+            output_dir = temp_path / "downloads"
+            output_dir.mkdir()
+
+            test_payload = b"PIED_PIPER_DESKTOP_API_PHASE7_INTEGRATION_TEST_DATA_" * 300  # ~15 KB
+            source_file.write_bytes(test_payload)
+
+            room_code_holder = []
+            progress_events = []
+            completed_events = []
+            room_ready_event = asyncio.Event()
+
+            async def run_live_test():
+                sender_callbacks = TransferCallbacks(
+                    on_room_created=lambda code: (room_code_holder.append(code), room_ready_event.set()),
+                    on_progress=lambda b, tot, spd, eta: progress_events.append((b, tot)),
+                    on_completed=lambda summary: completed_events.append(summary),
+                )
+
+                async def sender_task():
+                    return await start_send_session(
+                        filepath=source_file,
+                        callbacks=sender_callbacks,
+                        settings=custom_settings,
+                        timeout=10.0,
+                    )
+
+                async def receiver_task():
+                    await room_ready_event.wait()
+                    code = room_code_holder[0]
+                    return await start_receive_session(
+                        code=code,
+                        output_dir=output_dir,
+                        settings=custom_settings,
+                        timeout=10.0,
+                    )
+
+                return await asyncio.gather(sender_task(), receiver_task())
+
+            try:
+                sender_summary, receiver_summary = asyncio.run(run_live_test())
+                self.assertEqual(sender_summary.size_bytes, len(test_payload))
+                self.assertEqual(receiver_summary.size_bytes, len(test_payload))
+                self.assertEqual(sender_summary.sha256, receiver_summary.sha256)
+
+                received_file = output_dir / "desktop_payload.bin"
+                self.assertTrue(received_file.is_file())
+                self.assertEqual(received_file.read_bytes(), test_payload)
+                self.assertTrue(len(progress_events) > 0)
+                self.assertEqual(len(completed_events), 1)
+            finally:
+                server.should_exit = True
+                server_thread.join(timeout=1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

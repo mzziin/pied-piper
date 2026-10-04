@@ -13,7 +13,7 @@ def test_default_settings():
     assert settings.signaling_port == 8000
     assert settings.signaling_url == "ws://localhost:8000/ws"
     assert settings.room_ttl_seconds == 900
-    assert settings.chunk_size_bytes == 16384
+    assert settings.chunk_size_bytes == 262144
     assert settings.sliding_window_size == 32
     assert isinstance(settings.sqlite_path, Path)
     assert settings.sqlite_path == Path("./pied_piper.db")
