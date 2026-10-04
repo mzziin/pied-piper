@@ -40,9 +40,9 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--role",
         "-r",
-        choices=["send", "receive"],
+        choices=["send", "receive", "inspect"],
         required=True,
-        help="Operating role for this peer ('send' or 'receive')",
+        help="Operating role for this peer ('send', 'receive', or 'inspect')",
     )
     parser.add_argument(
         "--signaling-url",
@@ -192,6 +192,28 @@ async def run_receiver_flow(signaling_url: str, room_code: str, output_dir: Path
             await pc_wrapper.close()
 
 
+async def run_inspect_flow(settings: Settings) -> int:
+    """Inspect persisted SQLite transfer state from the command line."""
+    from backend.transfer.state_store import TransferStateStore
+    store = TransferStateStore(settings.sqlite_path)
+    await store.initialize()
+    transfers = await store.list_transfers()
+    print("\n" + "=" * 60)
+    print(f"       Pied Piper — Persisted Transfer State ({settings.sqlite_path})")
+    print("=" * 60)
+    print(f"Total Transfers: {len(transfers)}\n")
+    for t in transfers:
+        f = await store.get_file_by_transfer(t["transfer_id"])
+        print(f"Transfer ID: {t['transfer_id']} [{t['role'].upper()}] - Status: {t['status']}")
+        if f:
+            print(f"  File: {f['filename']} ({f['size_bytes']:,} bytes, {f['total_chunks']} chunks)")
+            print(f"  Highest Verified Chunk: {f['highest_verified_chunk']} / {f['total_chunks'] - 1}")
+            print(f"  Path: {f['file_path']}")
+        print("-" * 60)
+    print("=" * 60 + "\n")
+    return 0
+
+
 async def async_main(argv: Optional[List[str]] = None) -> int:
     """Async CLI entrypoint."""
     parser = create_parser()
@@ -227,6 +249,9 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                 print("Error: --room-code is required for 'receive' role.", file=sys.stderr)
                 return 1
             return await run_receiver_flow(signaling_url, args.room_code, args.output_dir, settings)
+
+        elif args.role == "inspect":
+            return await run_inspect_flow(settings)
 
         else:
             print(f"Error: Unknown role '{args.role}'", file=sys.stderr)

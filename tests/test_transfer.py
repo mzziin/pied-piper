@@ -167,8 +167,8 @@ async def test_corrupted_chunk_detection(tmp_path: Path):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                # Corrupt the payload bytes but keep original header
-                corrupted_frame = frame[:36] + b"CORRUPTED_INJECTED_DATA" + frame[36 + 23:]
+                # Corrupt the payload bytes but keep original 28-byte header
+                corrupted_frame = frame[:28] + b"CORRUPTED_INJECTED_DATA" + frame[28 + 23:]
                 original_send_data(corrupted_frame)
             else:
                 original_send_data(frame)
@@ -213,8 +213,11 @@ async def test_path_traversal_filename_rejection(tmp_path: Path):
         original_send_control = pc1.channels.send_control
 
         def malicious_send_control(msg):
-            if isinstance(msg, dict) and msg.get("type") == "file_offer":
-                msg["filename"] = "../../malicious_traversal.txt"
+            if isinstance(msg, dict):
+                if msg.get("type") == "file_offer":
+                    msg["filename"] = "../../malicious_traversal.txt"
+                elif msg.get("type") == "transfer_offer" and "files" in msg and msg["files"]:
+                    msg["files"][0]["filename"] = "../../malicious_traversal.txt"
             original_send_control(msg)
 
         pc1.channels.send_control = malicious_send_control

@@ -1,21 +1,45 @@
-"""Chunk model, incremental reading, SHA-256 hashing, and filename sanitization."""
+"""Chunk model, incremental reading, SHA-256 hashing, and filename sanitization.
+
+Includes binary data framing helpers and file manifest generation for Phase 7.
+"""
 
 import hashlib
 import math
-import re
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Tuple, Union
+import re
+from typing import Iterator, List, Optional, Tuple, Union
+import uuid
+
+from backend.protocol.framing import (
+    DATA_FRAME_HEADER_FORMAT,
+    DATA_FRAME_HEADER_SIZE,
+    FileManifestItem,
+    pack_data_frame,
+    unpack_data_frame,
+)
 
 
-@dataclass(frozen=True)
 class Chunk:
     """Represents a discrete slice of a file with integrity digest."""
-    index: int
-    offset: int
-    data: bytes
-    sha256: str
-    sha256_bytes: bytes
+
+    def __init__(
+        self,
+        index: int,
+        offset: int,
+        data: bytes,
+        sha256: str,
+        sha256_bytes: bytes,
+        file_id: Optional[str] = None,
+    ) -> None:
+        self.index: int = index
+        self.offset: int = offset
+        self.data: bytes = data
+        self.sha256: str = sha256
+        self.sha256_bytes: bytes = sha256_bytes
+        self.file_id: Optional[str] = file_id
+
+    def __repr__(self) -> str:
+        return f"Chunk(index={self.index}, offset={self.offset}, size={len(self.data)}, sha256={self.sha256[:8]}...)"
 
 
 def sanitize_filename(filename: str) -> str:
@@ -51,7 +75,7 @@ def sanitize_filename(filename: str) -> str:
     return cleaned
 
 
-def compute_file_metadata(filepath: Path, chunk_size: int = 16384) -> Tuple[int, int, str]:
+def compute_file_metadata(filepath: Path, chunk_size: int = 262144) -> Tuple[int, int, str]:
     """Compute file size, total number of chunks, and whole-file SHA-256 hash."""
     path = Path(filepath)
     if not path.is_file():
@@ -74,12 +98,62 @@ def compute_file_metadata(filepath: Path, chunk_size: int = 16384) -> Tuple[int,
     return file_size, total_chunks, hasher.hexdigest()
 
 
+def compute_file_manifest(
+    filepath: Path,
+    chunk_size: int = 262144,
+    file_id: Optional[str] = None,
+    include_chunk_hashes: bool = True,
+) -> FileManifestItem:
+    """Generate a full FileManifestItem with whole-file and per-chunk SHA-256 digests."""
+    path = Path(filepath)
+    if not path.is_file():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    fid = file_id or str(uuid.uuid4())
+    file_size = path.stat().st_size
+
+    if file_size == 0:
+        return FileManifestItem(
+            file_id=fid,
+            filename=path.name,
+            size=0,
+            sha256=hashlib.sha256(b"").hexdigest(),
+            chunk_size=chunk_size,
+            total_chunks=0,
+            chunk_hashes=[] if include_chunk_hashes else None,
+        )
+
+    total_chunks = math.ceil(file_size / chunk_size)
+    whole_hasher = hashlib.sha256()
+    chunk_hashes: List[str] = []
+
+    with path.open("rb") as f:
+        while True:
+            chunk_data = f.read(chunk_size)
+            if not chunk_data:
+                break
+            whole_hasher.update(chunk_data)
+            if include_chunk_hashes:
+                chunk_hashes.append(hashlib.sha256(chunk_data).hexdigest())
+
+    return FileManifestItem(
+        file_id=fid,
+        filename=path.name,
+        size=file_size,
+        sha256=whole_hasher.hexdigest(),
+        chunk_size=chunk_size,
+        total_chunks=total_chunks,
+        chunk_hashes=chunk_hashes if include_chunk_hashes else None,
+    )
+
+
 class FileChunkReader:
     """Incrementally reads a file in discrete chunks while computing running whole-file SHA-256."""
 
-    def __init__(self, filepath: Path, chunk_size: int = 16384) -> None:
+    def __init__(self, filepath: Path, chunk_size: int = 262144, file_id: Optional[str] = None) -> None:
         self.filepath: Path = Path(filepath)
         self.chunk_size: int = chunk_size
+        self.file_id: Optional[str] = file_id
         self.running_hasher = hashlib.sha256()
         self.bytes_read: int = 0
         self.chunks_read: int = 0
@@ -111,6 +185,7 @@ class FileChunkReader:
                     data=data,
                     sha256=chunk_sha256,
                     sha256_bytes=chunk_sha256_bytes,
+                    file_id=self.file_id,
                 )
                 index += 1
 
