@@ -495,7 +495,95 @@ class TestDesktopStep3456(unittest.TestCase):
 
         window.close()
 
+    def test_desktop_controller_to_controller_live_transfer(self) -> None:
+        """Verify complete live desktop-to-desktop transfer between two TransferControllers."""
+        import threading
+        import time
+        import uvicorn
+        from backend.config import get_settings
+        from backend.signaling.server import app as sig_app
+
+        port = 8925
+        old_sig_url = os.environ.get("SIGNALING_URL")
+        os.environ["SIGNALING_URL"] = f"ws://127.0.0.1:{port}/ws"
+        get_settings.cache_clear()
+
+        config = uvicorn.Config(app=sig_app, host="127.0.0.1", port=port, log_level="error")
+        server = uvicorn.Server(config=config)
+        server_thread = threading.Thread(target=server.run, daemon=True)
+        server_thread.start()
+        time.sleep(0.4)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            source_file = tmp_path / "desktop_live_payload.bin"
+            output_dir = tmp_path / "receiver_desktop_out"
+            output_dir.mkdir()
+
+            test_payload = b"DESKTOP_UI_CONTROLLER_END_TO_END_VERIFIED_DATA_" * 500  # ~23 KB
+            source_file.write_bytes(test_payload)
+
+            sender_ctrl = TransferController()
+            receiver_ctrl = TransferController()
+
+            sender_states = []
+            receiver_states = []
+            sender_ctrl.state_changed.connect(sender_states.append)
+            receiver_ctrl.state_changed.connect(receiver_states.append)
+
+            try:
+                ok = sender_ctrl.start_send(str(source_file))
+                self.assertTrue(ok)
+
+                # Wait for room code
+                wait_code_start = time.time()
+                while time.time() - wait_code_start < 5.0:
+                    self.app.processEvents()
+                    if sender_ctrl.session_code:
+                        break
+                    time.sleep(0.02)
+
+                self.assertIsNotNone(sender_ctrl.session_code)
+                code = sender_ctrl.session_code
+
+                ok = receiver_ctrl.start_receive(code=code, output_dir=str(output_dir))
+                self.assertTrue(ok)
+
+                # Wait for transfer completion
+                wait_trans_start = time.time()
+                while time.time() - wait_trans_start < 10.0:
+                    self.app.processEvents()
+                    if (
+                        sender_ctrl.state == TransferState.COMPLETED
+                        and receiver_ctrl.state == TransferState.COMPLETED
+                    ):
+                        break
+                    if (
+                        sender_ctrl.state == TransferState.FAILED
+                        or receiver_ctrl.state == TransferState.FAILED
+                    ):
+                        break
+                    time.sleep(0.02)
+
+                self.assertEqual(sender_ctrl.state, TransferState.COMPLETED)
+                self.assertEqual(receiver_ctrl.state, TransferState.COMPLETED)
+
+                received_file = output_dir / "desktop_live_payload.bin"
+                self.assertTrue(received_file.is_file())
+                self.assertEqual(received_file.read_bytes(), test_payload)
+            finally:
+                sender_ctrl.cancel()
+                receiver_ctrl.cancel()
+                server.should_exit = True
+                server_thread.join(timeout=1.0)
+                if old_sig_url is not None:
+                    os.environ["SIGNALING_URL"] = old_sig_url
+                else:
+                    os.environ.pop("SIGNALING_URL", None)
+                get_settings.cache_clear()
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
