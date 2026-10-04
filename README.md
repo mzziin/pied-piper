@@ -146,6 +146,34 @@ python -m backend.signaling.server --host 0.0.0.0 --port 8000
 
 ---
 
+## Running the Desktop Application
+
+The signaling server must be running as a standalone service before launching the desktop client:
+
+1. **Start the standalone signaling server** (on the host machine):
+   ```bash
+   python -m backend.signaling.server --host 0.0.0.0 --port 8000
+   ```
+
+2. **Launch the Desktop Application**:
+   - **Sender**:
+     ```bash
+     python desktop/main.py
+     ```
+     Click **Send File...**, choose a file, and click **Send**. The sender creates a room on the signaling server and displays the 6-character room code.
+   - **Receiver**:
+     - On the same machine:
+       ```bash
+       python desktop/main.py
+       ```
+     - On another machine on the same LAN:
+       ```bash
+       SIGNALING_URL=ws://<HOST_LAN_IP>:8000/ws python desktop/main.py
+       ```
+     Click **Receive File...**, enter the 6-character room code, and click **Continue**. Both peers negotiate direct WebRTC DataChannels and stream the file.
+
+---
+
 ## Running Single-Machine Transfers (CLI Reference Peer)
 
 ### Sender

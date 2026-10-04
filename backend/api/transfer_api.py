@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable, Optional, Union
 
 from backend.config import Settings, get_settings
-from backend.signaling.client import SignalingClient
+from backend.signaling.client import SignalingClient, SignalingError
 from backend.transfer.receiver import FileReceiver
 from backend.transfer.sender import FileSender, TransferSummary
 from backend.transport.peer_connection import PeerConnectionWrapper, establish_webrtc_connection
@@ -51,13 +51,14 @@ async def start_send_session(
     pc_wrapper: Optional[PeerConnectionWrapper] = None
 
     try:
-        from backend.signaling.server import is_local_signaling_url, start_embedded_signaling_server
-
-        if is_local_signaling_url(settings.signaling_url):
-            start_embedded_signaling_server(host=settings.signaling_host, port=settings.signaling_port)
-
         signaling = SignalingClient(url=settings.signaling_url)
-        await signaling.connect()
+        try:
+            await signaling.connect()
+        except Exception as exc:
+            raise SignalingError(
+                f"Cannot connect to signaling server at {settings.signaling_url}. "
+                "Ensure the standalone signaling server is running."
+            ) from exc
 
         room_code = await signaling.create_room()
         if callbacks.on_room_created:
@@ -139,13 +140,14 @@ async def start_receive_session(
     pc_wrapper: Optional[PeerConnectionWrapper] = None
 
     try:
-        from backend.signaling.server import is_local_signaling_url, start_embedded_signaling_server
-
-        if is_local_signaling_url(settings.signaling_url):
-            start_embedded_signaling_server(host=settings.signaling_host, port=settings.signaling_port)
-
         signaling = SignalingClient(url=settings.signaling_url)
-        await signaling.connect()
+        try:
+            await signaling.connect()
+        except Exception as exc:
+            raise SignalingError(
+                f"Cannot connect to signaling server at {settings.signaling_url}. "
+                "Ensure the standalone signaling server is running."
+            ) from exc
 
         await signaling.join_room(code)
 

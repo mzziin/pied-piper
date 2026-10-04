@@ -100,8 +100,13 @@ class TestTransferAPIIntegration(unittest.TestCase):
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
-    def test_controller_start_send_and_cancel(self) -> None:
+    @patch("app.controllers.transfer_controller.start_send_session")
+    def test_controller_start_send_and_cancel(self, mock_start_send) -> None:
         """Verify TransferController start_send and cancellation."""
+        async def fake_send(**kwargs):
+            await asyncio.sleep(10.0)
+
+        mock_start_send.side_effect = fake_send
         controller = TransferController()
 
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
@@ -112,14 +117,13 @@ class TestTransferAPIIntegration(unittest.TestCase):
             controller.select_file(tmp_path, 9)
             self.assertEqual(controller.state, TransferState.FILE_SELECTED)
 
-            with patch("backend.api.transfer_api.SignalingClient"):
-                res = controller.start_send()
-                self.assertTrue(res)
-                self.assertEqual(controller.state, TransferState.CREATING_SESSION)
+            res = controller.start_send()
+            self.assertTrue(res)
+            self.assertEqual(controller.state, TransferState.CREATING_SESSION)
 
-                # Cancel session
-                controller.cancel()
-                self.assertEqual(controller.state, TransferState.CANCELLED)
+            # Cancel session
+            controller.cancel()
+            self.assertEqual(controller.state, TransferState.CANCELLED)
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -131,6 +135,28 @@ class TestTransferAPIIntegration(unittest.TestCase):
         self.assertFalse(res)
         self.assertEqual(controller.state, TransferState.FAILED)
         self.assertIsNotNone(controller.error_message)
+
+    def test_offline_signaling_server_raises_clean_error(self) -> None:
+        """Verify that an unreachable standalone signaling server raises SignalingError and does not auto-start."""
+        from backend.config import Settings
+        from backend.signaling.client import SignalingError
+
+        dead_settings = Settings(
+            signaling_url="ws://127.0.0.1:59998/ws",
+            _env_file=None,
+        )
+
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(b"Test Offline")
+            tmp_path = tmp.name
+
+        try:
+            with self.assertRaises(SignalingError) as ctx:
+                asyncio.run(start_send_session(filepath=tmp_path, settings=dead_settings))
+            self.assertIn("Cannot connect to signaling server", str(ctx.exception))
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     def test_live_transfer_api_end_to_end(self) -> None:
         """Verify full live transfer between start_send_session and start_receive_session using Phase 7 protocol."""

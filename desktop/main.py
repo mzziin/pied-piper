@@ -17,7 +17,6 @@ from app.ui.style import apply_win95_theme
 def main() -> int:
     import logging
     from backend.config import get_settings
-    from backend.signaling.server import stop_embedded_signaling_server
 
     settings = get_settings()
     logging.basicConfig(
@@ -26,7 +25,6 @@ def main() -> int:
     )
 
     app = QApplication(sys.argv)
-    app.aboutToQuit.connect(stop_embedded_signaling_server)
     apply_win95_theme(app)
     window = MainWindow()
     window.show()
