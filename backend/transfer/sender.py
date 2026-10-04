@@ -26,6 +26,8 @@ from backend.protocol.framing import (
 from backend.protocol.window import SlidingWindow
 from backend.transport.data_channels import DataChannelManager
 
+from backend.transfer.state_store import TransferStateStore
+
 logger = logging.getLogger(__name__)
 
 
@@ -71,7 +73,7 @@ class TransferSummary:
 
 
 class FileSender:
-    """Orchestrates file streaming over WebRTC DataChannels using Phase 8 sliding window."""
+    """Orchestrates file streaming over WebRTC DataChannels using Phase 8 sliding window & Phase 10 persistence."""
 
     def __init__(
         self,
@@ -81,6 +83,7 @@ class FileSender:
         window_size: Optional[int] = None,
         progress_callback: Optional[Callable[[float, int, int], None]] = None,
         transfer_id: Optional[str] = None,
+        state_store: Optional[TransferStateStore] = None,
     ) -> None:
         self.channels: DataChannelManager = channels
         self.filepath: Path = Path(filepath)
@@ -88,6 +91,7 @@ class FileSender:
         self.window_size: int = window_size or get_settings().sliding_window_size
         self.progress_callback: Optional[Callable[[float, int, int], None]] = progress_callback
         self.transfer_id: str = transfer_id or str(uuid.uuid4())
+        self.state_store: TransferStateStore = state_store or TransferStateStore(get_settings().sqlite_path)
         self.window: Optional[SlidingWindow] = None
 
     async def send(self, timeout: float = 60.0) -> TransferSummary:
@@ -98,13 +102,31 @@ class FileSender:
         start_time = time.time()
         file_id = str(uuid.uuid4())
 
-        # 1. Build FileManifestItem (includes per-chunk hashes for Phase 7/8 integrity)
+        # 1. Build FileManifestItem (includes per-chunk hashes for Phase 7/8/10 integrity)
         manifest = compute_file_manifest(
             self.filepath,
             chunk_size=self.chunk_size,
             file_id=file_id,
             include_chunk_hashes=True,
         )
+
+        # 2. Persist initial transfer state to SQLite (§6.1)
+        await self.state_store.record_transfer(self.transfer_id, role="sender", status="in_progress")
+        await self.state_store.record_file(
+            file_id=file_id,
+            transfer_id=self.transfer_id,
+            filename=self.filepath.name,
+            file_path=self.filepath,
+            size_bytes=manifest.size,
+            total_chunks=manifest.total_chunks,
+            chunk_size_bytes=self.chunk_size,
+            sha256=manifest.sha256,
+            highest_verified_chunk=-1,
+            status="in_progress",
+        )
+        if manifest.chunk_hashes:
+            hashes_to_insert = [(idx, h, 0) for idx, h in enumerate(manifest.chunk_hashes)]
+            await self.state_store.record_chunk_hashes_batch(file_id, hashes_to_insert)
 
         logger.info(
             "Initiating transfer %s for '%s' (%d bytes, %d chunks, window_size: %d, SHA-256: %s)",
@@ -188,9 +210,14 @@ class FileSender:
                     elif isinstance(ack_msg, (TransferRejectMessage,)):
                         raise TransferError(f"Receiver rejected transfer: {ack_msg.reason}")
 
-            # Run producer and ACK consumer concurrently
-            await asyncio.gather(_stream_chunks(), _receive_acks())
-            await window.wait_all_acked(timeout=timeout)
+            try:
+                # Run producer and ACK consumer concurrently
+                await asyncio.gather(_stream_chunks(), _receive_acks())
+                await window.wait_all_acked(timeout=timeout)
+            except Exception:
+                await self.state_store.update_file_status(file_id, "failed")
+                await self.state_store.update_transfer_status(self.transfer_id, "failed")
+                raise
 
         # 6. Dispatch FileCompleteMessage
         file_complete = FileCompleteMessage(
@@ -206,6 +233,10 @@ class FileSender:
             sha256=manifest.sha256,
         )
         self.channels.send_control(complete_msg.model_dump())
+
+        # Update SQLite status to completed (§6.1)
+        await self.state_store.update_file_status(file_id, "completed")
+        await self.state_store.update_transfer_status(self.transfer_id, "completed")
 
         # Allow final control frames to flush across SCTP transport
         await asyncio.sleep(0.2)

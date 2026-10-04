@@ -26,8 +26,10 @@ from backend.protocol.framing import (
     unpack_chunk_frame,
     unpack_data_frame,
 )
+from backend.config import get_settings
 from backend.protocol.progress import ReceiverCheckpoint
 from backend.transfer.sender import IntegrityError, TransferError, TransferSummary
+from backend.transfer.state_store import TransferStateStore
 from backend.transport.data_channels import DataChannelManager
 
 logger = logging.getLogger(__name__)
@@ -41,10 +43,12 @@ class FileReceiver:
         channels: DataChannelManager,
         output_dir: Path,
         progress_callback: Optional[Callable[[float, int, int], None]] = None,
+        state_store: Optional[TransferStateStore] = None,
     ) -> None:
         self.channels: DataChannelManager = channels
         self.output_dir: Path = Path(output_dir)
         self.progress_callback: Optional[Callable[[float, int, int], None]] = progress_callback
+        self.state_store: TransferStateStore = state_store or TransferStateStore(get_settings().sqlite_path)
         self.checkpoint: Optional[ReceiverCheckpoint] = None
 
     @property
@@ -108,12 +112,31 @@ class FileReceiver:
 
         # Initialize receiver checkpoint tracker
         self.checkpoint = ReceiverCheckpoint(total_chunks=manifest.total_chunks)
+        chunk_hashes = manifest.chunk_hashes or []
 
-        # 3. Accept transfer offer
+        # 3. Persist initial transfer state to SQLite (§6.1)
+        await self.state_store.record_transfer(transfer_id, role="receiver", status="in_progress")
+        await self.state_store.record_file(
+            file_id=manifest.file_id,
+            transfer_id=transfer_id,
+            filename=sanitized_name,
+            file_path=final_path,
+            size_bytes=manifest.size,
+            total_chunks=manifest.total_chunks,
+            chunk_size_bytes=manifest.chunk_size,
+            sha256=manifest.sha256,
+            highest_verified_chunk=-1,
+            status="in_progress",
+        )
+        if chunk_hashes:
+            hashes_to_insert = [(idx, h, 0) for idx, h in enumerate(chunk_hashes)]
+            await self.state_store.record_chunk_hashes_batch(manifest.file_id, hashes_to_insert)
+
+        # 4. Accept transfer offer
         accept_msg = TransferAcceptMessage(transfer_id=transfer_id)
         self.channels.send_control(accept_msg.model_dump())
 
-        # 4. Await FileStartMessage
+        # 5. Await FileStartMessage
         start_str = await self.channels.receive_control(timeout=timeout)
         start_msg = parse_control_message(start_str)
         if not isinstance(start_msg, FileStartMessage):
@@ -171,7 +194,7 @@ class FileReceiver:
                     part_file.write(payload)
                     part_file.flush()
 
-                    # Advance checkpoint pointer
+                    # Advance in-memory checkpoint pointer
                     checkpoint_advanced = self.checkpoint.record_chunk_verified(chunk_index, len(payload))
                     if not checkpoint_advanced:
                         err_reason = (
@@ -182,6 +205,13 @@ class FileReceiver:
                             TransferFailedMessage(transfer_id=transfer_id, reason=err_reason).model_dump()
                         )
                         raise TransferError(err_reason)
+
+                    # Persist verified chunk hash and checkpoint to SQLite (§6.1, §6.2)
+                    chunk_digest = hashlib.sha256(payload).hexdigest()
+                    await self.state_store.record_chunk_hash(
+                        manifest.file_id, chunk_index, chunk_digest, verified=1
+                    )
+                    await self.state_store.update_file_checkpoint(manifest.file_id, chunk_index)
 
                     running_hasher.update(payload)
 
@@ -229,9 +259,15 @@ class FileReceiver:
             if not isinstance(trans_comp_msg, TransferCompleteMessage):
                 raise TransferError(f"Expected TransferCompleteMessage, got: {trans_comp_msg}")
 
+            # 9. Mark file and transfer as completed in SQLite (§6.1)
+            await self.state_store.update_file_status(manifest.file_id, "completed")
+            await self.state_store.update_transfer_status(transfer_id, "completed")
+
         except Exception:
             if part_path.exists():
                 part_path.unlink(missing_ok=True)
+            await self.state_store.update_file_status(manifest.file_id, "failed")
+            await self.state_store.update_transfer_status(transfer_id, "failed")
             raise
 
         duration = max(time.time() - start_time, 0.001)
